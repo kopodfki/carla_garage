@@ -21,6 +21,10 @@ behavior AdvBehavior():
     while True:
         take SetWalkingSpeedAction(0)
 
+behavior EgoExternalControl():
+    while True:
+        wait
+
 param OPT_ADV_SPEED = Range(3, 6)
 param OPT_ADV_DISTANCE = Range(5, 15)
 param OPT_STOP_DISTANCE = Range(0, 1)
@@ -33,17 +37,18 @@ EgoSpawnPt = new OrientedPoint on lane.centerline
 ego = new Car at EgoSpawnPt,
     with regionContainedIn None,
     with blueprint EGO_MODEL,
-#    with behavior AutopilotBehavior(),
-    with name "ego"
+    # with behavior AutopilotBehavior(),
+    with behavior EgoExternalControl(),
+    with name "ego",
+    with rolename "ego"
+
 # END GEOMETRY
 # BEGIN SPAWN
-# Hyperparameters for positioning the blocker (delivery truck) and adversarial pedestrian
-param OPT_GEO_BLOCKER_X_DISTANCE = Range(2, 6)      # lateral distance to the right of the ego's path
-param OPT_GEO_BLOCKER_Y_DISTANCE = Range(10, 40)    # longitudinal distance ahead of ego
-param OPT_GEO_X_DISTANCE = Range(-1, 1)             # small lateral shift for pedestrian behind blocker
-param OPT_GEO_Y_DISTANCE = Range(5, 1)            # longitudinal shift so pedestrian is behind blocker
+param OPT_GEO_BLOCKER_X_DISTANCE = Range(2, 6)
+param OPT_GEO_BLOCKER_Y_DISTANCE = Range(10, 40)
+param OPT_GEO_X_DISTANCE = Range(-1, 1)
+param OPT_GEO_Y_DISTANCE = Range(5, 1)
 
-# Place the delivery truck (modeled as a Car) on the right front of the ego, aligned with road direction
 IntSpawnPt = new OrientedPoint following roadDirection from EgoSpawnPt for globalParameters.OPT_GEO_BLOCKER_Y_DISTANCE
 Blocker = new Car right of IntSpawnPt by globalParameters.OPT_GEO_BLOCKER_X_DISTANCE,
     facing IntSpawnPt.heading,
@@ -51,7 +56,6 @@ Blocker = new Car right of IntSpawnPt by globalParameters.OPT_GEO_BLOCKER_X_DIST
     with regionContainedIn None,
     with name "blocker"
 
-# Spawn the adversarial pedestrian behind the delivery truck, on the sidewalk to the right front of ego
 SHIFT = Vector(globalParameters.OPT_GEO_X_DISTANCE, globalParameters.OPT_GEO_Y_DISTANCE)
 AdvAgent = new Pedestrian at Blocker offset along IntSpawnPt.heading by SHIFT,
     facing IntSpawnPt.heading + 90 deg,
@@ -65,12 +69,12 @@ require distance from ego to AdvAgent > 5
 require distance from ego to Blocker > 5
 require AdvAgent in network.walkableRegion
 require ego in network.drivableRegion
-require eventually AdvAgent in network.drivableRegion
+# require eventually AdvAgent in network.drivableRegion
 require ego.canSee(AdvAgent) and not ego.canSee(
     AdvAgent, occludingObjects=tuple([Blocker])
 )
-require eventually distance from ego to AdvAgent < 1
-require eventually distance from ego to Blocker > 3
+# require eventually distance from ego to AdvAgent < 1
+# require eventually distance from ego to Blocker > 3
 
 terminate after 30 seconds
 # END REQUIREMENTS
