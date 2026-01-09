@@ -47,7 +47,7 @@ ego = new Car at EgoSpawnPt,
 param OPT_GEO_BLOCKER_X_DISTANCE = Range(2, 6)
 param OPT_GEO_BLOCKER_Y_DISTANCE = Range(10, 40)
 param OPT_GEO_X_DISTANCE = Range(-1, 1)
-param OPT_GEO_Y_DISTANCE = Range(5, 1)
+param OPT_GEO_Y_DISTANCE = Range(1, 5)
 
 IntSpawnPt = new OrientedPoint following roadDirection from EgoSpawnPt for globalParameters.OPT_GEO_BLOCKER_Y_DISTANCE
 Blocker = new Car right of IntSpawnPt by globalParameters.OPT_GEO_BLOCKER_X_DISTANCE,

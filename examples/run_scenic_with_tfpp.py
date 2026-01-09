@@ -1,134 +1,100 @@
-#!/usr/bin/env python3
-import os
-import time
-import threading
-from pathlib import Path
-
-import numpy as np
+import os, sys, time
 import carla
+import numpy as np
 import scenic
+
 from scenic.simulators.carla.simulator import CarlaSimulator
+from scenic.core.simulators import SimulationCreationError
+from scenic.core.dynamics.utils import RejectSimulationException
 
-import external_control
+SCENIC_FILE  = "examples/scenario1.scenic"
+AGENT_CONFIG = "pretrained_models/all_towns"
+HOST         = "192.168.16.1"
+PORT         = 2000
+TOWN         = "Town05"
+TIMESTEP     = 0.05
+MAX_STEPS    = 10_000_000
+MAX_ATTEMPTS = 10
+CLEAN_WORLD  = True
+DEBUG        = False
 
-DEBUG = False
-TIMESTEP = 0.05
-MAX_STEPS = 800
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(THIS_DIR)
+for p in (REPO_ROOT,
+          os.path.join(REPO_ROOT, "team_code"),
+          os.path.join(REPO_ROOT, "scenario_runner"),
+          os.path.join(REPO_ROOT, "leaderboard")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-SCENIC_FILE = Path("examples/scenario1.scenic")
+from sensor_agent import SensorAgent
 
 
-def dbg(*a):
-    if DEBUG:
-        print(*a)
+def _is_listening(sensor) -> bool:
+    """CARLA sensors differ by version: is_listening can be a method or property."""
+    try:
+        v = getattr(sensor, "is_listening", False)
+        return v() if callable(v) else bool(v)
+    except Exception:
+        return False
 
 
-def find_vehicle_by_role(world: carla.World, role_name: str):
+def destroy_all_sensors(world: carla.World):
+    """Hard kill all sensors in the world (best effort)."""
+    try:
+        sensors = list(world.get_actors().filter("sensor.*"))
+    except Exception:
+        sensors = []
+    for s in sensors:
+        try:
+            if hasattr(s, "is_alive") and not s.is_alive:
+                continue
+            if isinstance(s, carla.Sensor) and _is_listening(s):
+                try: s.stop()
+                except Exception: pass
+            s.destroy()
+        except Exception:
+            pass
+
+
+def cleanup_dynamic_actors(world: carla.World):
+    """Destroy leftover vehicles/walkers/sensors from previous runs."""
+    kill = []
+    for a in world.get_actors():
+        tid = a.type_id
+        if tid.startswith("vehicle.") or tid.startswith("walker.") or tid.startswith("sensor."):
+            kill.append(a)
+
+    for a in kill:
+        try:
+            if hasattr(a, "is_alive") and not a.is_alive:
+                continue
+            if isinstance(a, carla.Sensor) and _is_listening(a):
+                try: a.stop()
+                except Exception: pass
+            a.destroy()
+        except Exception:
+            pass
+
+
+def find_ego(simulation, world):
+    """Prefer Scenic mapping; fallback to world scan by role_name."""
+    for obj in getattr(simulation, "objects", []):
+        if getattr(obj, "rolename", None) == "ego" or getattr(obj, "name", None) == "ego":
+            act = getattr(obj, "carlaActor", None)
+            if act is not None:
+                return act
     for v in world.get_actors().filter("vehicle.*"):
-        if v.attributes.get("role_name") == role_name:
+        if v.attributes.get("role_name") == "ego":
             return v
     return None
 
 
-class SensorInterface:
-    def __init__(self, expected_ids):
-        self.expected = set(expected_ids)
-        self.lock = threading.Condition()
-        self.buffer = {}
-
-    def push(self, sensor_id, frame, value):
-        with self.lock:
-            d = self.buffer.setdefault(frame, {})
-            d[sensor_id] = value
-            self.lock.notify_all()
-
-    def get_complete(self, timeout=2.0):
-        deadline = time.time() + timeout
-        with self.lock:
-            while True:
-                for frame in sorted(self.buffer.keys()):
-                    d = self.buffer[frame]
-                    if self.expected.issubset(d.keys()):
-                        self.buffer.pop(frame, None)
-                        return frame, d
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    return None, None
-                self.lock.wait(timeout=remaining)
-
-
-def spawn_sensors(world: carla.World, ego: carla.Vehicle, sensor_specs, iface: SensorInterface):
-    bp_lib = world.get_blueprint_library()
-    spawned = []
-
-    def make_transform(s):
-        loc = carla.Location(x=float(s.get("x", 0)), y=float(s.get("y", 0)), z=float(s.get("z", 0)))
-        rot = carla.Rotation(roll=float(s.get("roll", 0)), pitch=float(s.get("pitch", 0)), yaw=float(s.get("yaw", 0)))
-        return carla.Transform(loc, rot)
-
-    def on_rgb(sensor_id, image: carla.Image):
-        arr = np.frombuffer(image.raw_data, dtype=np.uint8)
-        arr = arr.reshape((image.height, image.width, 4))[:, :, :3]
-        arr = arr[:, :, ::-1]
-        iface.push(sensor_id, image.frame, arr)
-
-    def on_lidar(sensor_id, lidar: carla.LidarMeasurement):
-        pts = np.frombuffer(lidar.raw_data, dtype=np.float32).reshape((-1, 4))
-        iface.push(sensor_id, lidar.frame, pts)
-
-    def on_gnss(sensor_id, gnss: carla.GnssMeasurement):
-        iface.push(sensor_id, gnss.frame, {"lat": gnss.latitude, "lon": gnss.longitude, "z": gnss.altitude})
-
-    def on_imu(sensor_id, imu: carla.IMUMeasurement):
-        iface.push(
-            sensor_id,
-            imu.frame,
-            {
-                "accelerometer": (imu.accelerometer.x, imu.accelerometer.y, imu.accelerometer.z),
-                "gyroscope": (imu.gyroscope.x, imu.gyroscope.y, imu.gyroscope.z),
-                "compass": imu.compass,
-            },
-        )
-
-    for s in sensor_specs:
-        stype = s["type"]
-        sid = s["id"]
-        tf = make_transform(s)
-
-        if stype == "sensor.camera.rgb":
-            bp = bp_lib.find(stype)
-            bp.set_attribute("image_size_x", str(int(s.get("width", 800))))
-            bp.set_attribute("image_size_y", str(int(s.get("height", 600))))
-            bp.set_attribute("fov", str(float(s.get("fov", 90))))
-            sensor = world.spawn_actor(bp, tf, attach_to=ego)
-            sensor.listen(lambda data, _sid=sid: on_rgb(_sid, data))
-            spawned.append(sensor)
-
-        elif stype == "sensor.lidar.ray_cast":
-            bp = bp_lib.find(stype)
-            sensor = world.spawn_actor(bp, tf, attach_to=ego)
-            sensor.listen(lambda data, _sid=sid: on_lidar(_sid, data))
-            spawned.append(sensor)
-
-        elif stype == "sensor.other.gnss":
-            bp = bp_lib.find(stype)
-            sensor = world.spawn_actor(bp, tf, attach_to=ego)
-            sensor.listen(lambda data, _sid=sid: on_gnss(_sid, data))
-            spawned.append(sensor)
-
-        elif stype == "sensor.other.imu":
-            bp = bp_lib.find(stype)
-            sensor = world.spawn_actor(bp, tf, attach_to=ego)
-            sensor.listen(lambda data, _sid=sid: on_imu(_sid, data))
-            spawned.append(sensor)
-
-        else:
-            raise RuntimeError(f"Unsupported sensor type: {stype}")
-
-    return spawned
-
-
-def build_straight_global_plan(world: carla.World, ego: carla.Vehicle, meters_ahead=80.0):
+def build_gps_global_plan_dicts(world: carla.World, ego: carla.Vehicle, meters_ahead=250.0, step=2.0):
+    """
+    TFPP nav_planner expects: [(pos_dict, cmd), ...]
+    where pos_dict has keys 'lat','lon','z'
+    """
     try:
         from agents.navigation.local_planner import RoadOption
         cmd = RoadOption.LANEFOLLOW
@@ -136,164 +102,261 @@ def build_straight_global_plan(world: carla.World, ego: carla.Vehicle, meters_ah
         cmd = 0
 
     m = world.get_map()
-    start = ego.get_transform()
-    wp0 = m.get_waypoint(start.location)
-    wp1 = wp0.next(meters_ahead)[0]
-    end = wp1.transform
+    wp = m.get_waypoint(ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
+    n = max(2, int(meters_ahead / step))
 
-    world_plan = [(start, cmd), (end, cmd)]
+    plan = []
+    for _ in range(n):
+        loc = wp.transform.location
+        geo = m.transform_to_geolocation(loc)
+        pos = {"lat": float(geo.latitude), "lon": float(geo.longitude), "z": float(geo.altitude)}
+        plan.append((pos, cmd))
 
-    g0 = m.transform_to_geolocation(start.location)
-    g1 = m.transform_to_geolocation(end.location)
-    gps_plan = [
-        ({"lat": g0.latitude, "lon": g0.longitude, "z": g0.altitude}, cmd),
-        ({"lat": g1.latitude, "lon": g1.longitude, "z": g1.altitude}, cmd),
-    ]
-    return gps_plan, world_plan
-
-
-def run_scenic(scene, sim_kwargs, done_evt, exc_holder):
-    try:
-        import inspect
-        from scenic.simulators.carla.simulator import CarlaSimulator
-
-        sim_kwargs = dict(sim_kwargs)
-        sim_kwargs["timestep"] = TIMESTEP
-
-        sig = inspect.signature(CarlaSimulator.__init__)
-        allowed = set(sig.parameters.keys())
-        allowed.discard("self")
-        filtered = {k: v for k, v in sim_kwargs.items() if k in allowed}
-
-        sim = CarlaSimulator(**filtered)
-
-        sim.createSimulation(scene, maxSteps=MAX_STEPS, name="tfpp")
-
-    except Exception as e:
-        exc_holder["exc"] = e
-    finally:
-        done_evt.set()
-
-
-def main():
-    if not SCENIC_FILE.exists():
-        raise FileNotFoundError(f"Cannot find {SCENIC_FILE}. Run from repo root?")
-
-    scenario = scenic.scenarioFromFile(str(SCENIC_FILE), params={"use2DMap": True})
-    scene, _ = scenario.generate()
-
-    address = getattr(scenario, "params", {}).get("address", "127.0.0.1")
-    port = int(getattr(scenario, "params", {}).get("port", 2000))
-    carla_map = getattr(scenario, "params", {}).get("carla_map", None)
-    map_path = getattr(scenario, "params", {}).get("map", None)
-
-    if carla_map is None or map_path is None:
-        raise RuntimeError("Your Scenic file must define params 'carla_map' and 'map' (xodr path).")
-
-    sim_kwargs = dict(
-        address=address,
-        port=port,
-        carla_map=carla_map,
-        map_path=map_path,
-        render=True,
-    )
-
-    done_evt = threading.Event()
-    exc_holder = {}
-    t = threading.Thread(target=run_scenic, args=(scene, sim_kwargs, done_evt, exc_holder), daemon=True)
-    t.start()
-
-    client = carla.Client(address, port)
-    client.set_timeout(10.0)
-    world = client.get_world()
-
-    ego = None
-    for _ in range(200):
-        ego = find_vehicle_by_role(world, "ego")
-        if ego is not None:
+        nxt = wp.next(step)
+        if not nxt:
             break
-        if done_evt.is_set():
-            break
-        time.sleep(0.05)
+        wp = nxt[0]
+    return plan
 
-    if ego is None:
-        if "exc" in exc_holder:
-            raise RuntimeError("Scenic thread crashed before spawning ego") from exc_holder["exc"]
-        raise RuntimeError("Could not find ego vehicle with role_name='ego'")
 
-    dbg("Found ego:", ego.id)
+class SensorBuffer:
+    """
+    Spawn sensors from agent.sensors() and provide input_data as:
+      input_data[sensor_id] = (timestamp, data)
+    IMPORTANT: TFPP expects speed as dict: {'speed': <kmh>}
+    """
+    def __init__(self, world: carla.World, ego: carla.Vehicle):
+        self.world = world
+        self.ego = ego
+        self.sensors = []
+        self.expected = []
+        self.speedometer_ids = set()
+        self.latest = {}
 
-    from team_code.sensor_agent import SensorAgent
+    def spawn_from_agent(self, agent):
+        if not hasattr(agent, "sensors"):
+            return
 
-    import inspect
-    sig = inspect.signature(SensorAgent)
-    if "carla_port" in sig.parameters:
-        agent = SensorAgent(carla_port=port)
-    else:
-        agent = SensorAgent(port)
+        specs = agent.sensors()
+        lib = self.world.get_blueprint_library()
 
-    if hasattr(agent, "setup"):
-        try:
-            agent.setup(str(Path(".")))
-        except TypeError:
-            agent.setup()
-
-    gps_plan, world_plan = build_straight_global_plan(world, ego)
-    if hasattr(agent, "set_global_plan"):
-        try:
-            agent.set_global_plan(gps_plan, world_plan)
-        except TypeError:
-            try:
-                agent.set_global_plan(world_plan)
-            except Exception:
-                pass
-
-    sensor_specs = agent.sensors()
-    sensor_ids = [s["id"] for s in sensor_specs if s["type"] != "sensor.speed"]
-    iface = SensorInterface(sensor_ids)
-    sensors = spawn_sensors(world, ego, [s for s in sensor_specs if s["type"] != "sensor.speed"], iface)
-
-    try:
-        external_control.put((0.0, 0.0, 0.0))
-
-        while not done_evt.is_set():
-            frame, data = iface.get_complete(timeout=2.0)
-            if frame is None:
+        for s in specs:
+            stype = s.get("type")
+            sid = s.get("id")
+            if not stype or not sid:
                 continue
 
-            input_data = {sid: (frame, payload) for sid, payload in data.items()}
+            self.expected.append(sid)
 
-            v = ego.get_velocity()
-            speed = float((v.x * v.x + v.y * v.y + v.z * v.z) ** 0.5)
-            input_data["speed"] = (frame, {"speed": speed})
+            if stype == "sensor.speedometer":
+                self.speedometer_ids.add(sid)
+                continue
 
-            ts = world.get_snapshot().timestamp.elapsed_seconds
+            bp = lib.find(stype)
 
-            control = agent.run_step(input_data, ts)
-            external_control.put((float(control.throttle), float(control.steer), float(control.brake)))
+            if "width" in s and bp.has_attribute("image_size_x"):
+                bp.set_attribute("image_size_x", str(s["width"]))
+            if "height" in s and bp.has_attribute("image_size_y"):
+                bp.set_attribute("image_size_y", str(s["height"]))
+            if "fov" in s and bp.has_attribute("fov"):
+                bp.set_attribute("fov", str(s["fov"]))
+            if bp.has_attribute("sensor_tick"):
+                bp.set_attribute("sensor_tick", str(TIMESTEP))
 
-            if DEBUG:
-                adv = None
-                for w in world.get_actors().filter("walker.pedestrian.*"):
-                    adv = w
+            tf = carla.Transform(
+                carla.Location(float(s.get("x", 0)), float(s.get("y", 0)), float(s.get("z", 0))),
+                carla.Rotation(float(s.get("roll", 0)), float(s.get("pitch", 0)), float(s.get("yaw", 0))),
+            )
+
+            actor = self.world.spawn_actor(bp, tf, attach_to=self.ego)
+            actor.listen(self._cb_maker(sid))
+            self.sensors.append(actor)
+
+    def _cb_maker(self, sid):
+        def cb(meas):
+            frame = getattr(meas, "frame", None)
+            self.latest[sid] = (frame, self._convert(meas))
+        return cb
+
+    def _convert(self, meas):
+        if isinstance(meas, carla.Image):
+            arr = np.frombuffer(meas.raw_data, dtype=np.uint8).reshape((meas.height, meas.width, 4))
+            return arr[:, :, :3][:, :, ::-1]
+
+        if isinstance(meas, (carla.LidarMeasurement, carla.SemanticLidarMeasurement)):
+            return np.frombuffer(meas.raw_data, dtype=np.float32).reshape((-1, 4))
+
+        if isinstance(meas, carla.GnssMeasurement):
+            return np.array([meas.latitude, meas.longitude, meas.altitude], dtype=np.float32)
+
+        if isinstance(meas, carla.IMUMeasurement):
+            return np.array([
+                meas.accelerometer.x, meas.accelerometer.y, meas.accelerometer.z,
+                meas.gyroscope.x, meas.gyroscope.y, meas.gyroscope.z,
+                meas.compass
+            ], dtype=np.float32)
+
+        return meas
+
+    def input_data(self, frame, timestamp):
+        v = self.ego.get_velocity()
+        speed_mps = float((v.x*v.x + v.y*v.y + v.z*v.z) ** 0.5)
+        speed_kmh = speed_mps * 3.6
+        for sid in self.speedometer_ids:
+            self.latest[sid] = (frame, {"speed": speed_kmh})
+
+        deadline = time.time() + 0.3
+        while time.time() < deadline:
+            ok = True
+            for sid in self.expected:
+                if sid in self.speedometer_ids:
+                    continue
+                fr, _ = self.latest.get(sid, (None, None))
+                if fr != frame:
+                    ok = False
                     break
-                if adv:
-                    d = ego.get_location().distance(adv.get_location())
-                    dbg(f"frame={frame} speed={speed:.2f}m/s dist_to_ped={d:.1f}m")
+            if ok:
+                break
+            time.sleep(0.001)
 
-        if "exc" in exc_holder:
-            raise exc_holder["exc"]
+        out = {}
+        for sid in self.expected:
+            fr, data = self.latest.get(sid, (None, None))
+            if fr == frame:
+                out[sid] = (timestamp, data)
+        return out
 
-    finally:
-        for s in sensors:
+    def destroy(self):
+        for s in self.sensors:
             try:
-                s.stop()
-            except Exception:
-                pass
-            try:
+                if hasattr(s, "is_alive") and not s.is_alive:
+                    continue
+                if isinstance(s, carla.Sensor) and _is_listening(s):
+                    try: s.stop()
+                    except Exception: pass
                 s.destroy()
             except Exception:
                 pass
+        self.sensors.clear()
+        self.expected.clear()
+        self.speedometer_ids.clear()
+        self.latest.clear()
+
+
+def main():
+    try:
+        agent = SensorAgent(AGENT_CONFIG, PORT)
+    except TypeError:
+        agent = SensorAgent(AGENT_CONFIG, HOST, PORT)
+
+    try:
+        agent.setup(AGENT_CONFIG, time.strftime("%Y%m%d-%H%M%S"), None)
+    except TypeError:
+        agent.setup(AGENT_CONFIG)
+
+    scenario = scenic.scenarioFromFile(SCENIC_FILE, mode2D=True, params={"use2DMap": True})
+
+    sim = CarlaSimulator(
+        carla_map=TOWN,
+        map_path=None,
+        address=HOST,
+        port=PORT,
+        timeout=10.0,
+        render=True,
+        traffic_manager_port=None,
+        timestep=TIMESTEP,
+    )
+
+    if CLEAN_WORLD:
+        cleanup_dynamic_actors(sim.world)
+
+    simulation = None
+    sensors = None
+
+    try:
+        last_err = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            scene, _ = scenario.generate()
+            try:
+                simulation = sim.createSimulation(scene, timestep=TIMESTEP, maxSteps=MAX_STEPS, name=f"attempt{attempt}")
+                simulation.setup()
+                print(f"Simulation ready (attempt {attempt})")
+                break
+            except (SimulationCreationError, RejectSimulationException, RuntimeError) as e:
+                last_err = e
+                try:
+                    if simulation is not None:
+                        simulation.destroy()
+                except Exception:
+                    pass
+                simulation = None
+
+        if simulation is None:
+            raise RuntimeError(f"Failed to create simulation after {MAX_ATTEMPTS} attempts. Last error: {last_err}")
+
+        world = simulation.world
+        ego = find_ego(simulation, world)
+        if ego is None:
+            raise RuntimeError("Could not find ego after simulation.setup().")
+
+        ego.set_autopilot(False)
+        ego.set_simulate_physics(True)
+
+        gps_global_plan = build_gps_global_plan_dicts(world, ego)
+        agent._global_plan = gps_global_plan
+
+        sensors = SensorBuffer(world, ego)
+        sensors.spawn_from_agent(agent)
+        for _ in range(5):
+            simulation.step()
+
+        while True:
+            simulation.step()
+            snap = world.get_snapshot()
+            ts = snap.timestamp
+            frame = snap.frame
+
+            input_data = sensors.input_data(frame, ts)
+            control = agent.run_step(input_data, ts)
+            ego.apply_control(control)
+
+            if DEBUG and frame % 20 == 0:
+                v = ego.get_velocity()
+                sp = float((v.x*v.x + v.y*v.y + v.z*v.z) ** 0.5)
+                loc = ego.get_transform().location
+                print(f"frame={frame} speed={sp:.2f} m/s pos=({loc.x:.1f},{loc.y:.1f})")
+
+    finally:
+        try:
+            if sensors is not None:
+                sensors.destroy()
+        except Exception:
+            pass
+
+        try:
+            destroy_all_sensors(sim.world)
+        except Exception:
+            pass
+
+        try:
+            if simulation is not None:
+                simulation.destroy()
+        except Exception:
+            pass
+
+        try:
+            sim.destroy()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(agent, "destroy"):
+                try:
+                    agent.destroy({})
+                except TypeError:
+                    agent.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
