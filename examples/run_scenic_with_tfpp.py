@@ -2,14 +2,17 @@ import os, sys, time
 import carla
 import numpy as np
 import scenic
+from scenic.simulators.carla.simulator import CarlaSimulator
+
+import examples.external_control
 
 from scenic.simulators.carla.simulator import CarlaSimulator
 from scenic.core.simulators import SimulationCreationError
-from scenic.core.dynamics.utils import RejectSimulationException
+# from scenic.core.dynamics.utils import RejectSimulationException
 
 SCENIC_FILE  = "examples/scenario1.scenic"
 AGENT_CONFIG = "pretrained_models/all_towns"
-HOST         = "192.168.16.1"
+HOST         = "127.0.0.1"
 PORT         = 2000
 TOWN         = "Town05"
 TIMESTEP     = 0.05
@@ -254,7 +257,7 @@ def main():
     except TypeError:
         agent.setup(AGENT_CONFIG)
 
-    scenario = scenic.scenarioFromFile(SCENIC_FILE, mode2D=True, params={"use2DMap": True})
+    scenario = scenic.scenarioFromFile(SCENIC_FILE, params={"use2DMap": True})
 
     sim = CarlaSimulator(
         carla_map=TOWN,
@@ -263,8 +266,7 @@ def main():
         port=PORT,
         timeout=10.0,
         render=True,
-        traffic_manager_port=None,
-        timestep=TIMESTEP,
+        traffic_manager_port=None
     )
 
     if CLEAN_WORLD:
@@ -278,11 +280,11 @@ def main():
         for attempt in range(1, MAX_ATTEMPTS + 1):
             scene, _ = scenario.generate()
             try:
-                simulation = sim.createSimulation(scene, timestep=TIMESTEP, maxSteps=MAX_STEPS, name=f"attempt{attempt}")
-                simulation.setup()
+                simulation = sim.createSimulation(scene)
+                # simulation.setup()
                 print(f"Simulation ready (attempt {attempt})")
                 break
-            except (SimulationCreationError, RejectSimulationException, RuntimeError) as e:
+            except Exception as e:
                 last_err = e
                 try:
                     if simulation is not None:
@@ -307,24 +309,66 @@ def main():
 
         sensors = SensorBuffer(world, ego)
         sensors.spawn_from_agent(agent)
+
+        import scenic.syntax.veneer as veneer
+
+        veneer.beginSimulation(simulation)
+        dynamicScenario = simulation.scene.dynamicScenario
+        dynamicScenario._start()
+
+        for obj in simulation.objects:
+            obj.startDynamicSimulation()
+
+        simulation.updateObjects()
+
+        for obj in simulation.objects:
+            if getattr(obj, "rolename", None) == "ego":
+                scenic_ego = obj
+                break
+
+        carla_ego = scenic_ego.carlaActor  # actual CARLA vehicle
+
+        # simulation.run(maxSteps = 5000)
         for _ in range(5):
             simulation.step()
 
         while True:
-            simulation.step()
+            dynamicScenario._step()
+            dynamicScenario._runMonitors()
+
+            # 2. Compute actions
+            allActions = {}
+            for scenic_agent in simulation.agents:
+                behavior = scenic_agent.behavior
+                if not behavior._runningIterator:
+                    behavior._start(scenic_agent)
+                actions = behavior._step()
+                allActions[scenic_agent] = actions
+
+            # 3. Execute actions
+            simulation.executeActions(allActions)
+
+            # 4. External ego override 
             snap = world.get_snapshot()
             ts = snap.timestamp
             frame = snap.frame
 
             input_data = sensors.input_data(frame, ts)
             control = agent.run_step(input_data, ts)
-            ego.apply_control(control)
+            carla_ego.apply_control(control)
 
-            if DEBUG and frame % 20 == 0:
-                v = ego.get_velocity()
-                sp = float((v.x*v.x + v.y*v.y + v.z*v.z) ** 0.5)
-                loc = ego.get_transform().location
-                print(f"frame={frame} speed={sp:.2f} m/s pos=({loc.x:.1f},{loc.y:.1f})")
+            simulation.step()
+
+            # 6. Sync back to Scenic
+            simulation.updateObjects()
+            simulation.currentTime += 1
+
+        import inspect
+        sig = inspect.signature(SensorAgent)
+        if "carla_port" in sig.parameters:
+            agent = SensorAgent(carla_port=port, carla_host=address)
+        else:
+            agent = SensorAgent(port)
 
     finally:
         try:

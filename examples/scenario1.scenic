@@ -1,12 +1,12 @@
 '''The ego vehicle is driving on a straight road. The adversarial pedestrian is hidden behind a parked delivery truck on the right front. The pedestrian sprints abruptly into the road directly in front of the ego vehicle. Due to the sudden appearance and short reaction time, the ego vehicle collides with the pedestrian.'''
-param address = "192.168.16.1"
+param address = "127.0.0.1"
 param port = 2000
 # BEGIN TOWN
 Town = 'Town05'
 # END TOWN
 # BEGIN IMPORTS
 # param use2DMap = True
-param map = localPath(f'/mnt/c/git/scenic_bertha/assets/maps/CARLA/{Town}.xodr')
+param map = localPath(f'/home/tda/Desktop/phd/code/ChatScene/safebench/scenario/scenario_data/scenic_data/maps/{Town}.xodr')
 param carla_map = Town
 model scenic.simulators.carla.model
 EGO_MODEL = "vehicle.lincoln.mkz_2017"
@@ -32,9 +32,9 @@ param OPT_STOP_DISTANCE = Range(0, 1)
 # BEGIN GEOMETRY
 lane = Uniform(*network.lanes)
 EgoTrajectory = lane.centerline
-EgoSpawnPt = new OrientedPoint on lane.centerline
+EgoSpawnPt =  OrientedPoint on lane.centerline
 
-ego = new Car at EgoSpawnPt,
+ego =  Car at EgoSpawnPt,
     with regionContainedIn None,
     with blueprint EGO_MODEL,
     # with behavior AutopilotBehavior(),
@@ -49,15 +49,15 @@ param OPT_GEO_BLOCKER_Y_DISTANCE = Range(10, 40)
 param OPT_GEO_X_DISTANCE = Range(-1, 1)
 param OPT_GEO_Y_DISTANCE = Range(1, 5)
 
-IntSpawnPt = new OrientedPoint following roadDirection from EgoSpawnPt for globalParameters.OPT_GEO_BLOCKER_Y_DISTANCE
-Blocker = new Car right of IntSpawnPt by globalParameters.OPT_GEO_BLOCKER_X_DISTANCE,
+IntSpawnPt =  OrientedPoint following roadDirection from EgoSpawnPt for globalParameters.OPT_GEO_BLOCKER_Y_DISTANCE
+Blocker =  Car right of IntSpawnPt by globalParameters.OPT_GEO_BLOCKER_X_DISTANCE,
     facing IntSpawnPt.heading,
     with blueprint EGO_MODEL,
     with regionContainedIn None,
     with name "blocker"
 
 SHIFT = Vector(globalParameters.OPT_GEO_X_DISTANCE, globalParameters.OPT_GEO_Y_DISTANCE)
-AdvAgent = new Pedestrian at Blocker offset along IntSpawnPt.heading by SHIFT,
+AdvAgent =  Pedestrian at Blocker offset along IntSpawnPt.heading by SHIFT,
     facing IntSpawnPt.heading + 90 deg,
     with regionContainedIn None,
     with behavior AdvBehavior(),
@@ -65,14 +65,14 @@ AdvAgent = new Pedestrian at Blocker offset along IntSpawnPt.heading by SHIFT,
 # END SPAWN
 
 # BEGIN REQUIREMENTS
-require distance from ego to AdvAgent > 5
-require distance from ego to Blocker > 5
-require AdvAgent in network.walkableRegion
-require ego in network.drivableRegion
+# require distance from ego to AdvAgent > 5
+# require distance from ego to Blocker > 5
+# require AdvAgent in network.walkableRegion
+# require ego in network.drivableRegion
 # require eventually AdvAgent in network.drivableRegion
-require ego.canSee(AdvAgent) and not ego.canSee(
-    AdvAgent, occludingObjects=tuple([Blocker])
-)
+# require ego.canSee(AdvAgent) and not ego.canSee(
+#     AdvAgent, occludingObjects=tuple([Blocker])
+# )
 # require eventually distance from ego to AdvAgent < 1
 # require eventually distance from ego to Blocker > 3
 
